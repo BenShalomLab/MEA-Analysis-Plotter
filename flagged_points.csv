@@ -1,0 +1,5 @@
+NeuronType,CHIP_WELL,DIV,Active_area,is_outlier,is_bad_residual
+FxHET,M07039_3,8,50.8030303,True,False
+FxHET,M07039_6,8,56.40909091,True,False
+MxWT,M07039_5,13,52.06060606,True,False
+MxWT,M07039_5,16,76.04545455,True,True
