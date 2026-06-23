@@ -25,7 +25,8 @@ EXCEL_PATH    = "/mnt/disk15tb/sabadnoor/CDKL5_Dec2025/MaxTwo MEA Primary Neuron
 SHEET_NAME    = "CDKL5-R59X_T14_12152025_PS"
 FIGURES_PATH  = "/mnt/disk15tb/sabadnoor/CDKL5_Dec2025/figures/"
 CSV_PATH      = "/mnt/disk15tb/sabadnoor/CDKL5_Dec2025/final_merged_mea_data.csv"
-DIV_COL       = 'DIV'
+DIV_COL       = 'DIV'             # DIV column name in the CSV
+EXCEL_DIV_COL = 'DIV.1'           # DIV column name in the Excel sheet (varies by export)
 UNITS_COL     = 'diag_n_units'   # CDKL5 uses 'diag_n_units', Folic Acid uses 'n_units'
 PEAK_DIV_MIN  = 15                # peak activity window
 PEAK_DIV_MAX  = 22
@@ -54,7 +55,12 @@ df = pd.read_csv(CSV_PATH)
 # Fix path parsing if Well column was not extracted correctly from file paths.
 # This happens when the CSV was generated with a different folder structure —
 # the Well field ends up containing 'network_results.json' instead of the well ID.
-if df['Well'].str.contains('network_results').any():
+if df['Well'].str.contains('network_results', na=False).any():
+    if 'full_path' not in df.columns:
+        raise KeyError(
+            "Well column needs reparsing (contains 'network_results') but no "
+            "'full_path' column exists in the CSV to reparse from."
+        )
     ANCHOR = SHEET_NAME.replace('_SA', '').replace('_ARedit', '')
     def parse_path(path):
         parts = path.replace("\\", "/").split("/")
@@ -119,8 +125,8 @@ peak_summary = (
     .groupby('Well')
     .agg(
         mean_occupancy=('channel_occupancy', 'mean'),
-        mean_nb=('nb_count', 'median'),
-        mean_bl=('bl_count', 'median')
+        median_nb=('nb_count', 'median'),
+        median_bl=('bl_count', 'median')
     )
     .reset_index()
 )
@@ -163,10 +169,10 @@ pw_cols = [c for c in all_cols if re.fullmatch(r'P\d+W\d+', str(c))]
 
 if w_cols:
     print(f"\nDetected Format A: {len(w_cols)} well columns (W1-W{len(w_cols)})")
-    aa_data = aa_raw[['DIV.1'] + w_cols].copy()
-    aa_data = aa_data.dropna(subset=['DIV.1'])
-    aa_data = aa_data[(aa_data['DIV.1'] >= PEAK_DIV_MIN) & (aa_data['DIV.1'] <= PEAK_DIV_MAX)]
-    aa_long = aa_data.melt(id_vars='DIV.1', var_name='Well_Excel', value_name='active_area_pct')
+    aa_data = aa_raw[[EXCEL_DIV_COL] + w_cols].copy()
+    aa_data = aa_data.dropna(subset=[EXCEL_DIV_COL])
+    aa_data = aa_data[(aa_data[EXCEL_DIV_COL] >= PEAK_DIV_MIN) & (aa_data[EXCEL_DIV_COL] <= PEAK_DIV_MAX)]
+    aa_long = aa_data.melt(id_vars=EXCEL_DIV_COL, var_name='Well_Excel', value_name='active_area_pct')
     aa_long['active_area_pct'] = pd.to_numeric(aa_long['active_area_pct'], errors='coerce')
     aa_long = aa_long.dropna(subset=['active_area_pct'])
     aa_stats = aa_long.groupby('Well_Excel').agg(
@@ -179,10 +185,10 @@ if w_cols:
 
 elif pw_cols:
     print(f"\nDetected Format B: {len(pw_cols)} well columns (PxWy format)")
-    aa_data = aa_raw[['DIV.1'] + pw_cols].copy()
-    aa_data = aa_data.dropna(subset=['DIV.1'])
-    aa_data = aa_data[(aa_data['DIV.1'] >= PEAK_DIV_MIN) & (aa_data['DIV.1'] <= PEAK_DIV_MAX)]
-    aa_long = aa_data.melt(id_vars='DIV.1', var_name='Well_Excel', value_name='active_area_pct')
+    aa_data = aa_raw[[EXCEL_DIV_COL] + pw_cols].copy()
+    aa_data = aa_data.dropna(subset=[EXCEL_DIV_COL])
+    aa_data = aa_data[(aa_data[EXCEL_DIV_COL] >= PEAK_DIV_MIN) & (aa_data[EXCEL_DIV_COL] <= PEAK_DIV_MAX)]
+    aa_long = aa_data.melt(id_vars=EXCEL_DIV_COL, var_name='Well_Excel', value_name='active_area_pct')
     aa_long['active_area_pct'] = pd.to_numeric(aa_long['active_area_pct'], errors='coerce')
     aa_long = aa_long.dropna(subset=['active_area_pct'])
     # Each P*W* is its own unique well — kept separate so the KDE uses all
@@ -200,18 +206,31 @@ elif pw_cols:
 else:
     raise ValueError("Could not detect Active Area % columns. Expected W1/W2 or P1W1/P1W2 format.")
 
-# Fit KDE and find natural valleys (thresholds) in the distribution
+# Fit KDE and find natural valleys (thresholds) in the distribution.
+# Guard against edge cases where KDE can't be fit: no data, a single well,
+# or zero variance (all wells share the same Active Area % value).
 values = aa_stats['mean_active_area_peak'].values
-kde    = gaussian_kde(values, bw_method=0.15)
-x      = np.linspace(0, 100, 1000)
-y      = kde(x)
 
-valleys     = argrelmin(y, order=20)[0]
-valley_vals = sorted([x[v] for v in valleys])
+if len(values) == 0:
+    raise ValueError("No Active Area % values available after filtering — cannot compute QC thresholds.")
 
-# Only need 2 thresholds for 3 tiers
-bad_threshold     = valley_vals[0] if len(valley_vals) > 0 else float(np.percentile(values, 15))
-caution_threshold = valley_vals[1] if len(valley_vals) > 1 else float(np.percentile(values, 50))
+if len(values) < 2 or np.allclose(values, values[0]):
+    # Not enough variation to fit a KDE — fall back to percentile-based thresholds
+    valley_vals = []
+    x = y = None
+    bad_threshold     = float(np.percentile(values, 15))
+    caution_threshold = float(np.percentile(values, 50))
+else:
+    kde = gaussian_kde(values, bw_method=0.15)
+    x   = np.linspace(0, 100, 1000)
+    y   = kde(x)
+
+    valleys     = argrelmin(y, order=20)[0]
+    valley_vals = sorted([x[v] for v in valleys])
+
+    # Only need 2 thresholds for 3 tiers
+    bad_threshold     = valley_vals[0] if len(valley_vals) > 0 else float(np.percentile(values, 15))
+    caution_threshold = valley_vals[1] if len(valley_vals) > 1 else float(np.percentile(values, 50))
 
 def assign_tier(val):
     if val < bad_threshold:         return 'Bad'
@@ -222,8 +241,8 @@ def assign_explanation(row):
     val  = round(row['mean_active_area_peak'], 1)
     tier = row['QC_tier']
     occ  = f"{round(row['mean_occupancy'], 1)}%" if pd.notna(row.get('mean_occupancy')) else "N/A"
-    nb   = round(row['mean_nb'], 1) if pd.notna(row.get('mean_nb')) else 'N/A'
-    bl   = round(row['mean_bl'], 1) if pd.notna(row.get('mean_bl')) else 'N/A'
+    nb   = round(row['median_nb'], 1) if pd.notna(row.get('median_nb')) else 'N/A'
+    bl   = round(row['median_bl'], 1) if pd.notna(row.get('median_bl')) else 'N/A'
 
     if tier == 'Bad':
         return (f"Channel occupancy: {occ} | Network bursts (median, DIV {PEAK_DIV_MIN}-{PEAK_DIV_MAX}): {nb} | "
@@ -268,14 +287,16 @@ for tier in ['Good', 'Use with caution', 'Bad']:
 os.makedirs(FIGURES_PATH, exist_ok=True)
 colors = {'Bad': 'red', 'Use with caution': 'orange', 'Good': 'darkgreen'}
 plt.figure(figsize=(12, 5))
-plt.plot(x, y, 'b-', linewidth=2, label='KDE distribution')
+if x is not None and y is not None:
+    plt.plot(x, y, 'b-', linewidth=2, label='KDE distribution')
 plt.axvline(bad_threshold,     color='red',    linestyle='--', label=f'Bad < {round(bad_threshold,1)}%')
-plt.axvline(caution_threshold, color='orange', linestyle='--', label=f'Good > {round(caution_threshold,1)}%')
+plt.axvline(caution_threshold, color='orange', linestyle='--', label=f'Good >= {round(caution_threshold,1)}%')
 for _, row in aa_stats.iterrows():
     plt.axvline(row['mean_active_area_peak'], color=colors[row['QC_tier']], alpha=0.5, linewidth=2)
 plt.xlabel(f'Mean Active Area % (DIV {PEAK_DIV_MIN}-{PEAK_DIV_MAX})')
 plt.title('QC Tiers — Active Area % Distribution (thresholds from KDE valleys)')
 plt.legend()
 plt.tight_layout()
-plt.savefig(FIGURES_PATH + 'qc_tiers.png')
-print(f"\nPlot saved to {FIGURES_PATH}qc_tiers.png")
+qc_tiers_path = os.path.join(FIGURES_PATH, 'qc_tiers.png')
+plt.savefig(qc_tiers_path)
+print(f"\nPlot saved to {qc_tiers_path}")
