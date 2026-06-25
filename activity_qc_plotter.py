@@ -176,6 +176,8 @@ def test_genotype_lmm(
     figsize=(5.5, 5.0),
     height_ratios=(3, 2),
     alpha=0.05,
+    show_fit_panel=False,
+    plot=True,
     save_path=None,
 ):
     """
@@ -187,12 +189,12 @@ def test_genotype_lmm(
       1. Genotype main effect  — is one group persistently higher/lower?
       2. Genotype × DIV        — do trajectories diverge over time?
 
-    Panel A: raw data mean ± SEM per genotype.
-    Panel B: LMM population-level fitted trajectories (fixed effects only).
+    Panel A: raw data mean ± SEM + LRT badge.
+    Panel B: LMM population-level fitted trajectories (only when show_fit_panel=True).
 
     Returns
     -------
-    fig, ax_data, ax_fit, lrt_results dict
+    fig, ax_data, ax_fit (None if show_fit_panel=False), lrt_results dict
     """
     try:
         import statsmodels.formula.api as smf
@@ -239,6 +241,22 @@ def test_genotype_lmm(
                 return label
         return "ns"
 
+    # ── All pairwise Wald tests (refit with each non-first group as reference) ─
+    def _wald(fit, g_col, ref_s, g):
+        key = f"C({g_col}, Treatment('{ref_s}'))[T.{g}]"
+        if key in fit.pvalues.index:
+            return float(fit.tvalues[key]), float(fit.pvalues[key])
+        return np.nan, np.nan
+
+    from itertools import combinations as _comb
+    pairwise_wald = {}
+    for g1, g2 in _comb(group_order, 2):
+        r_s = g1.replace("'", "\\'")
+        f_pw = f"{value_col} ~ C({group_col}, Treatment('{r_s}')) * {div_col}"
+        fit_pw = _fit(f_pw)
+        z, p = _wald(fit_pw, group_col, r_s, g2)
+        pairwise_wald[(g1, g2)] = {"z": z, "p": p}
+
     # ── Print ────────────────────────────────────────────────────────────────
     w = 62
     print("=" * w)
@@ -266,28 +284,58 @@ def test_genotype_lmm(
         print("  ✓ No significant genotype effect on Active Area.")
         print("    → Absolute-threshold QC is defensible.")
 
-    print(f"\n  ── Fixed-effect coefficients (full model) {'─'*20}")
+    print(f"\n  ── Pairwise Wald tests (full model) {'─'*25}")
+    print(f"  {'Comparison':<28} {'z':>7}  {'p':>9}  {'':>5}")
+    print(f"  {'-'*28} {'-'*7}  {'-'*9}  {'-'*5}")
+    for (g1, g2), res in pairwise_wald.items():
+        label = f"{g1} vs {g2}"
+        z_str = f"{res['z']:>7.3f}" if np.isfinite(res['z']) else "    nan"
+        p_str = f"{res['p']:>9.4f}" if np.isfinite(res['p']) else "      nan"
+        print(f"  {label:<28} {z_str}  {p_str}  {_stars(res['p']) if np.isfinite(res['p']) else '':>5}")
+
+    print(f"\n  ── Fixed-effect coefficients (full model, ref={ref}) {'─'*8}")
     fe_table = fit_full.summary().tables[1]
     print(fe_table.as_text() if hasattr(fe_table, "as_text") else fe_table.to_string())
 
-    # ── Population-level fitted values (subtract random intercepts) ──────────
-    re_vals = {k: float(v.iloc[0]) for k, v in fit_full.random_effects.items()}
-    df_w["_re"]       = df_w[unit_col].map(re_vals).fillna(0.0)
-    df_w["_fe_fitted"] = fit_full.fittedvalues - df_w["_re"]
-    fitted_agg = (df_w.groupby([group_col, div_col])["_fe_fitted"]
-                  .mean().reset_index())
+    lrt_results = {"main": lrt_main, "interaction": lrt_int, "fit_full": fit_full,
+                   "pairwise_wald": pairwise_wald}
+
+    if not plot:
+        return None, None, None, lrt_results
+
+    # ── Population-level fitted values (only needed for Panel B) ─────────────
+    fitted_agg = None
+    if show_fit_panel:
+        re_vals = {k: float(v.iloc[0]) for k, v in fit_full.random_effects.items()}
+        df_w["_re"]        = df_w[unit_col].map(re_vals).fillna(0.0)
+        df_w["_fe_fitted"] = fit_full.fittedvalues - df_w["_re"]
+        fitted_agg = df_w.groupby([group_col, div_col])["_fe_fitted"].mean().reset_index()
+
+    # ── LRT badge ────────────────────────────────────────────────────────────
+    badge = (
+        f"Genotype main:   χ²({lrt_main['df']}) = {lrt_main['chi2']:.2f},  "
+        f"p = {lrt_main['p']:.3f}  {_stars(lrt_main['p'])}\n"
+        f"Genotype × DIV:  χ²({lrt_int['df']}) = {lrt_int['chi2']:.2f},  "
+        f"p = {lrt_int['p']:.3f}  {_stars(lrt_int['p'])}"
+    )
 
     # ── Figure ───────────────────────────────────────────────────────────────
     with plt.rc_context(_RC):
         fig = plt.figure(figsize=figsize)
-        gs  = GridSpec(2, 1, figure=fig,
-                       height_ratios=list(height_ratios),
-                       hspace=0.10,
-                       left=0.12, right=0.82, top=0.93, bottom=0.10)
-        ax_data = fig.add_subplot(gs[0])
-        ax_fit  = fig.add_subplot(gs[1], sharex=ax_data)
+        if show_fit_panel:
+            gs = GridSpec(2, 1, figure=fig,
+                          height_ratios=list(height_ratios),
+                          hspace=0.10,
+                          left=0.12, right=0.82, top=0.93, bottom=0.10)
+            ax_data = fig.add_subplot(gs[0])
+            ax_fit  = fig.add_subplot(gs[1], sharex=ax_data)
+        else:
+            gs = GridSpec(1, 1, figure=fig,
+                          left=0.12, right=0.82, top=0.93, bottom=0.10)
+            ax_data = fig.add_subplot(gs[0])
+            ax_fit  = None
 
-        # Panel A: raw data
+        # Panel A: raw data + LRT badge
         for g in group_order:
             sub = df_w[df_w[group_col] == g]
             sg  = sub.groupby(div_col)[value_col].agg(["mean", "sem"]).dropna()
@@ -301,40 +349,37 @@ def test_genotype_lmm(
                 color=col, alpha=0.20, zorder=3,
             )
 
+        ax_data.text(0.99, 0.03, badge, transform=ax_data.transAxes,
+                     fontsize=6, va="bottom", ha="right", family="monospace",
+                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc", alpha=0.9))
+
         sns.despine(ax=ax_data)
         ax_data.set_ylabel(f"{value_col.replace('_', ' ')} (%)", fontsize=9, fontweight="bold")
-        plt.setp(ax_data.get_xticklabels(), visible=False)
+        if not show_fit_panel:
+            ax_data.set_xlabel(div_col, fontsize=9, fontweight="bold")
+        else:
+            plt.setp(ax_data.get_xticklabels(), visible=False)
         ax_data.legend(frameon=False, fontsize=7,
                        bbox_to_anchor=(1.02, 1), loc="upper left")
-        ax_data.text(0.01, 1.02, "A  Data (mean ± SEM)",
-                     transform=ax_data.transAxes,
-                     fontsize=8, fontweight="bold", va="bottom", ha="left")
 
-        # Panel B: LMM fitted (population level)
-        for g in group_order:
-            sub_fit = fitted_agg[fitted_agg[group_col] == g].sort_values(div_col)
-            col     = color_map.get(g, "black")
-            ax_fit.plot(sub_fit[div_col].to_numpy(dtype=float),
-                        sub_fit["_fe_fitted"].to_numpy(),
-                        "-o", lw=1.8, markersize=3, color=col, zorder=4)
+        # Panel B: LMM fitted (population level) — optional
+        if show_fit_panel and fitted_agg is not None:
+            for g in group_order:
+                sub_fit = fitted_agg[fitted_agg[group_col] == g].sort_values(div_col)
+                col     = color_map.get(g, "black")
+                ax_fit.plot(sub_fit[div_col].to_numpy(dtype=float),
+                            sub_fit["_fe_fitted"].to_numpy(),
+                            "-o", lw=1.8, markersize=3, color=col, zorder=4)
 
-        # LRT significance badge
-        badge = (f"Genotype: {_stars(lrt_main['p'])}  |  "
-                 f"Trend: {_stars(lrt_int['p'])}")
-        ax_fit.text(0.97, 0.96, badge, transform=ax_fit.transAxes,
-                    fontsize=7, va="top", ha="right",
-                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#cccccc", alpha=0.9))
-
-        sns.despine(ax=ax_fit)
-        ax_fit.set_xlabel(div_col, fontsize=9, fontweight="bold")
-        ax_fit.set_ylabel(f"LMM fitted\n{value_col.replace('_', ' ')} (%)",
-                          fontsize=9, fontweight="bold")
-        ax_fit.text(0.01, 1.02, "B  LMM population-level fit",
-                    transform=ax_fit.transAxes,
-                    fontsize=8, fontweight="bold", va="bottom", ha="left")
+            sns.despine(ax=ax_fit)
+            ax_fit.set_xlabel(div_col, fontsize=9, fontweight="bold")
+            ax_fit.set_ylabel(f"LMM fitted\n{value_col.replace('_', ' ')} (%)",
+                              fontsize=9, fontweight="bold")
+            ax_fit.text(0.01, 1.02, "B  LMM population-level fit",
+                        transform=ax_fit.transAxes,
+                        fontsize=8, fontweight="bold", va="bottom", ha="left")
 
         if save_path:
             fig.savefig(save_path, bbox_inches="tight", format="svg")
 
-    return fig, ax_data, ax_fit, {"main": lrt_main, "interaction": lrt_int,
-                                   "fit_full": fit_full}
+    return fig, ax_data, ax_fit, lrt_results

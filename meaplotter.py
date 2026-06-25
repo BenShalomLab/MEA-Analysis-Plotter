@@ -108,18 +108,65 @@ class MEAPlotter:
     def _safe_cohens_d(d1, d2):
         d1 = pd.Series(d1).dropna()
         d2 = pd.Series(d2).dropna()
-
         if len(d1) < 2 or len(d2) < 2:
             return np.nan
-
         sd1 = d1.std(ddof=1)
         sd2 = d2.std(ddof=1)
         pooled_std = np.sqrt((sd1**2 + sd2**2) / 2)
-
         if not np.isfinite(pooled_std) or pooled_std <= 0:
             return np.nan
-
         return (d1.mean() - d2.mean()) / pooled_std
+
+    @staticmethod
+    def _fmt_grp(d):
+        """Format a group's data as 'mean ± SEM (n=N)' or 'NA (n=N)'."""
+        d = pd.Series(d).dropna()
+        if len(d) == 0:
+            return "NA (n=0)"
+        sem = d.sem() if len(d) > 1 else np.nan
+        sem_str = f"{sem:.2f}" if np.isfinite(sem) else "NA"
+        return f"{d.mean():.2f} ± {sem_str} (n={len(d)})"
+
+    @staticmethod
+    def _build_color_map(group_order, palette):
+        """Build {group: color} from a dict palette or seaborn palette name."""
+        if isinstance(palette, dict):
+            return {g: palette[g] for g in group_order}
+        colors = sns.color_palette(palette, len(group_order))
+        return {g: colors[i] for i, g in enumerate(group_order)}
+
+    @staticmethod
+    def _compute_clip_cap(yvals, method="quantile", q=0.98, k=1.5):
+        """Return upper clip ceiling or None if clip disabled / no data."""
+        yvals = pd.Series(yvals).dropna()
+        if len(yvals) == 0:
+            return None
+        if method == "iqr":
+            q1, q3 = float(yvals.quantile(0.25)), float(yvals.quantile(0.75))
+            iqr = q3 - q1
+            return float(q3 + k * iqr) if np.isfinite(iqr) and iqr > 0 else float(yvals.quantile(q))
+        return float(yvals.quantile(q))
+
+    def _draw_upper_outliers(self, ax, d, y, div_col, group_col,
+                             div_order, group_order, div_to_x, offsets, color_map, cap,
+                             stem_frac=0.04, marker_size=26):
+        """Lollipop markers for values above cap (shared by line and bar plots)."""
+        upper_out = d[d[y] > cap].copy()
+        if upper_out.empty:
+            return
+        ymin_ax, ymax_ax = ax.get_ylim()
+        yr = ymax_ax - ymin_ax
+        y_tip   = ymax_ax - 0.01 * yr
+        y_stem0 = y_tip   - stem_frac * yr
+        for _, r in upper_out.iterrows():
+            div_val, g = r[div_col], r[group_col]
+            if div_val not in div_order or g not in group_order:
+                continue
+            x   = float(div_to_x[div_val]) + offsets[g]
+            col = color_map[g]
+            ax.plot([x, x], [y_stem0, y_tip], color=col, lw=0.9, zorder=5)
+            ax.scatter([x], [y_tip], marker="^", s=marker_size,
+                       color=col, edgecolor="black", linewidth=0.25, zorder=6)
 
     def get_style(
         self,
@@ -202,39 +249,25 @@ class MEAPlotter:
 
             if len(d1) <= 1 or len(d2) <= 1:
                 pairwise_df = pd.DataFrame([{
-                    "group1": g1,
-                    "group2": g2,
-                    "comparison": f"{g1} vs {g2}",
-                    "p_adj": np.nan,
-                    "raw_p": np.nan,
-                    "reject": False,
-                    "stat": np.nan,
-                    "Grp1_Stats": f"{d1.mean():.2f} ± {self._safe_sem(d1):.2f} (n={len(d1)})" if len(d1) > 0 else f"NA (n={len(d1)})",
-                    "Grp2_Stats": f"{d2.mean():.2f} ± {self._safe_sem(d2):.2f} (n={len(d2)})" if len(d2) > 0 else f"NA (n={len(d2)})",
-                    "Cohen's d": np.nan
+                    "group1": g1, "group2": g2, "comparison": f"{g1} vs {g2}",
+                    "p_adj": np.nan, "raw_p": np.nan, "reject": False, "stat": np.nan,
+                    "Grp1_Stats": self._fmt_grp(d1), "Grp2_Stats": self._fmt_grp(d2),
+                    "Cohen's d": np.nan,
                 }])
-                return {
-                    "test_type": "t-test",
-                    "omnibus_stat": np.nan,
-                    "omnibus_p": np.nan,
-                    "pairwise_df": pairwise_df
-                }
+                return {"test_type": "t-test", "omnibus_stat": np.nan,
+                        "omnibus_p": np.nan, "pairwise_df": pairwise_df}
 
             # Standard 2-group independent t-test
             t_stat, p_val = stats.ttest_ind(d1, d2, equal_var=True, nan_policy="omit")
             cohens_d = self._safe_cohens_d(d1, d2)
 
             pairwise_df = pd.DataFrame([{
-                "group1": g1,
-                "group2": g2,
-                "comparison": f"{g1} vs {g2}",
-                "p_adj": p_val,
-                "raw_p": p_val,
+                "group1": g1, "group2": g2, "comparison": f"{g1} vs {g2}",
+                "p_adj": p_val, "raw_p": p_val,
                 "reject": bool(p_val < alpha) if np.isfinite(p_val) else False,
                 "stat": t_stat,
-                "Grp1_Stats": f"{d1.mean():.2f} ± {self._safe_sem(d1):.2f} (n={len(d1)})",
-                "Grp2_Stats": f"{d2.mean():.2f} ± {self._safe_sem(d2):.2f} (n={len(d2)})",
-                "Cohen's d": cohens_d
+                "Grp1_Stats": self._fmt_grp(d1), "Grp2_Stats": self._fmt_grp(d2),
+                "Cohen's d": cohens_d,
             }])
 
             return {
@@ -282,35 +315,21 @@ class MEAPlotter:
                 d2 = d.loc[d[group_col] == g2, y].dropna()
 
                 pairwise_rows.append({
-                    "group1": g1,
-                    "group2": g2,
-                    "comparison": f"{g1} vs {g2}",
+                    "group1": g1, "group2": g2, "comparison": f"{g1} vs {g2}",
                     "p_adj": float(row["p_adj"]) if pd.notna(row["p_adj"]) else np.nan,
-                    "raw_p": np.nan,
-                    "reject": bool(row["reject"]),
-                    "stat": row["stat"],
-                    "Grp1_Stats": f"{d1.mean():.2f} ± {self._safe_sem(d1):.2f} (n={len(d1)})" if len(d1) > 0 else f"NA (n={len(d1)})",
-                    "Grp2_Stats": f"{d2.mean():.2f} ± {self._safe_sem(d2):.2f} (n={len(d2)})" if len(d2) > 0 else f"NA (n={len(d2)})",
-                    "Cohen's d": self._safe_cohens_d(d1, d2)
+                    "raw_p": np.nan, "reject": bool(row["reject"]), "stat": row["stat"],
+                    "Grp1_Stats": self._fmt_grp(d1), "Grp2_Stats": self._fmt_grp(d2),
+                    "Cohen's d": self._safe_cohens_d(d1, d2),
                 })
         else:
-            # still return rows for all pairwise combinations so tables stay informative
-            pairs = list(combinations(present_groups, 2))
-            for g1, g2 in pairs:
+            for g1, g2 in combinations(present_groups, 2):
                 d1 = d.loc[d[group_col] == g1, y].dropna()
                 d2 = d.loc[d[group_col] == g2, y].dropna()
-
                 pairwise_rows.append({
-                    "group1": g1,
-                    "group2": g2,
-                    "comparison": f"{g1} vs {g2}",
-                    "p_adj": np.nan,
-                    "raw_p": np.nan,
-                    "reject": False,
-                    "stat": np.nan,
-                    "Grp1_Stats": f"{d1.mean():.2f} ± {self._safe_sem(d1):.2f} (n={len(d1)})" if len(d1) > 0 else f"NA (n={len(d1)})",
-                    "Grp2_Stats": f"{d2.mean():.2f} ± {self._safe_sem(d2):.2f} (n={len(d2)})" if len(d2) > 0 else f"NA (n={len(d2)})",
-                    "Cohen's d": self._safe_cohens_d(d1, d2)
+                    "group1": g1, "group2": g2, "comparison": f"{g1} vs {g2}",
+                    "p_adj": np.nan, "raw_p": np.nan, "reject": False, "stat": np.nan,
+                    "Grp1_Stats": self._fmt_grp(d1), "Grp2_Stats": self._fmt_grp(d2),
+                    "Cohen's d": self._safe_cohens_d(d1, d2),
                 })
 
         pairwise_df = pd.DataFrame(pairwise_rows)
@@ -579,115 +598,63 @@ class MEAPlotter:
     # backward-compatible Welch APIs
     # --------------------------
     def calculate_stats_welch(self, df, group_col, y, group_order=None):
+        """Pairwise Welch t-tests (uncorrected) across groups, no DIV grouping."""
+        return self.calculate_stats_by_div_welch(
+            df, div_col=None, group_col=group_col, y=y, group_order=group_order
+        )
+
+    def calculate_stats_by_div_welch(self, df, div_col, group_col, y,
+                                     div_order=None, group_order=None):
         """
-        Backward-compatible Welch t-test (uncorrected), pairwise across groups.
-        Preserved so existing notebook code does not break.
+        Pairwise Welch t-tests (uncorrected) per DIV.
+        Pass div_col=None to test across all data without DIV grouping.
         """
-        data = df.dropna(subset=[group_col, y]).copy()
+        drop_cols = [c for c in [div_col, group_col, y] if c is not None]
+        data = df.dropna(subset=drop_cols).copy()
+        if div_col is not None:
+            data[div_col] = pd.to_numeric(data[div_col], errors="coerce")
+            data = data.dropna(subset=[div_col])
+            data[div_col] = data[div_col].astype(int)
+            div_vals = self._resolve_div_order(data, div_col, div_order)
+        else:
+            div_vals = [None]
+
         group_order = self._resolve_group_order(data, group_col, group_order)
-        pairs = list(combinations(group_order, 2))
-        rows = []
+        pairs       = list(combinations(group_order, 2))
+        rows        = []
 
-        print(f"\n{'='*20} STATS (Welch, uncorrected): {y} {'='*20}")
+        label = f"{y} by {div_col}" if div_col else y
+        print(f"\n{'='*20} STATS (Welch, uncorrected): {label} {'='*20}")
 
-        for g1, g2 in pairs:
-            d1 = data.loc[data[group_col] == g1, y].dropna()
-            d2 = data.loc[data[group_col] == g2, y].dropna()
-
-            n1, n2 = len(d1), len(d2)
-            if n1 <= 1 or n2 <= 1:
-                print(f"{g1} vs {g2}: not enough data (n1={n1}, n2={n2})")
-                rows.append({
-                    "Comparison": f"{g1} vs {g2}",
-                    "Grp1_Stats": f"NA (n={n1})" if n1 == 0 else f"{d1.mean():.2f} ± {d1.sem():.2f} (n={n1})",
-                    "Grp2_Stats": f"NA (n={n2})" if n2 == 0 else f"{d2.mean():.2f} ± {d2.sem():.2f} (n={n2})",
-                    "t-stat": np.nan,
-                    "p-val": np.nan,
-                    "Sig": "ns",
-                    "Cohen's d": np.nan
-                })
+        for div_val in div_vals:
+            sub   = data[data[div_col] == div_val] if div_col is not None else data
+            if sub.empty:
                 continue
+            if div_val is not None:
+                print(f"\n--- DIV {div_val} ---")
+            indent = "  " if div_val is not None else ""
 
-            t_stat, p_val = stats.ttest_ind(d1, d2, equal_var=False, nan_policy="omit")
-            mean1, mean2 = d1.mean(), d2.mean()
-            sem1, sem2 = d1.sem(), d2.sem()
-            cohens_d = self._safe_cohens_d(d1, d2)
-            stars = self._stars_from_p(p_val)
-
-            print(f"{g1} (n={n1}) vs {g2} (n={n2}): p={p_val:.4e} ({stars}), d={cohens_d:.3f}")
-
-            rows.append({
-                "Comparison": f"{g1} vs {g2}",
-                "Grp1_Stats": f"{mean1:.2f} ± {sem1:.2f} (n={n1})",
-                "Grp2_Stats": f"{mean2:.2f} ± {sem2:.2f} (n={n2})",
-                "t-stat": t_stat,
-                "p-val": p_val,
-                "Sig": stars,
-                "Cohen's d": cohens_d
-            })
-
-        return pd.DataFrame(rows)
-
-    def calculate_stats_by_div_welch(self, df, div_col, group_col, y, div_order=None, group_order=None):
-        """
-        Backward-compatible Welch t-tests (uncorrected) per DIV.
-        Preserved so existing notebook code does not break.
-        """
-        data = df.dropna(subset=[div_col, group_col, y]).copy()
-        data[div_col] = pd.to_numeric(data[div_col], errors="coerce")
-        data = data.dropna(subset=[div_col])
-        data[div_col] = data[div_col].astype(int)
-
-        div_order = self._resolve_div_order(data, div_col, div_order)
-        group_order = self._resolve_group_order(data, group_col, group_order)
-        pairs = list(combinations(group_order, 2))
-        rows = []
-
-        print(f"\n{'='*20} STATS (Welch, uncorrected): {y} by {div_col} {'='*20}")
-
-        for div_val in div_order:
-            div_data = data[data[div_col] == div_val]
-            if div_data.empty:
-                continue
-
-            print(f"\n--- DIV {div_val} ---")
             for g1, g2 in pairs:
-                d1 = div_data.loc[div_data[group_col] == g1, y].dropna()
-                d2 = div_data.loc[div_data[group_col] == g2, y].dropna()
-
+                d1 = sub.loc[sub[group_col] == g1, y].dropna()
+                d2 = sub.loc[sub[group_col] == g2, y].dropna()
                 n1, n2 = len(d1), len(d2)
+                base = {"Comparison": f"{g1} vs {g2}",
+                        "Grp1_Stats": self._fmt_grp(d1),
+                        "Grp2_Stats": self._fmt_grp(d2),
+                        "Cohen's d":  np.nan}
+                if div_val is not None:
+                    base["DIV"] = div_val
                 if n1 <= 1 or n2 <= 1:
-                    print(f"  {g1} vs {g2}: not enough data (n1={n1}, n2={n2})")
-                    rows.append({
-                        "DIV": div_val,
-                        "Comparison": f"{g1} vs {g2}",
-                        "Grp1_Stats": f"NA (n={n1})" if n1 == 0 else f"{d1.mean():.2f} ± {d1.sem():.2f} (n={n1})",
-                        "Grp2_Stats": f"NA (n={n2})" if n2 == 0 else f"{d2.mean():.2f} ± {d2.sem():.2f} (n={n2})",
-                        "t-stat": np.nan,
-                        "p-val": np.nan,
-                        "Sig": "ns",
-                        "Cohen's d": np.nan
-                    })
+                    print(f"{indent}{g1} vs {g2}: not enough data (n1={n1}, n2={n2})")
+                    rows.append({**base, "t-stat": np.nan, "p-val": np.nan, "Sig": "ns"})
                     continue
-
                 t_stat, p_val = stats.ttest_ind(d1, d2, equal_var=False, nan_policy="omit")
-                mean1, mean2 = d1.mean(), d2.mean()
-                sem1, sem2 = d1.sem(), d2.sem()
                 cohens_d = self._safe_cohens_d(d1, d2)
-                stars = self._stars_from_p(p_val)
-
-                print(f"  {g1} (n={n1}) vs {g2} (n={n2}): p={p_val:.4e} ({stars}), d={cohens_d:.3f}")
-
-                rows.append({
-                    "DIV": div_val,
-                    "Comparison": f"{g1} vs {g2}",
-                    "Grp1_Stats": f"{mean1:.2f} ± {sem1:.2f} (n={n1})",
-                    "Grp2_Stats": f"{mean2:.2f} ± {sem2:.2f} (n={n2})",
-                    "t-stat": t_stat,
-                    "p-val": p_val,
-                    "Sig": stars,
-                    "Cohen's d": cohens_d
-                })
+                stars    = self._stars_from_p(p_val)
+                print(f"{indent}{g1} (n={n1}) vs {g2} (n={n2}): "
+                      f"p={p_val:.4e} ({stars}), d={cohens_d:.3f}")
+                rows.append({**base, "t-stat": t_stat, "p-val": p_val,
+                             "Sig": stars, "Cohen's d": cohens_d})
 
         return pd.DataFrame(rows)
 
@@ -960,11 +927,7 @@ class MEAPlotter:
             fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
         # ---------------- Colors ----------------
-        if isinstance(palette, dict):
-            color_map = {g: palette[g] for g in group_order}
-        else:
-            colors = sns.color_palette(palette, len(group_order))
-            color_map = {g: colors[i] for i, g in enumerate(group_order)}
+        color_map = self._build_color_map(group_order, palette)
 
         # ---------------- X offsets ----------------
         n_groups = len(group_order)
@@ -975,19 +938,7 @@ class MEAPlotter:
             offsets = {g: raw_offsets[i] for i, g in enumerate(group_order)}
 
         # ---------------- Robust upper clip ----------------
-        cap = None
-        if clip_upper:
-            yvals = d[y].dropna()
-            if len(yvals) > 0:
-                if clip_method == "iqr":
-                    q1, q3 = yvals.quantile([0.25, 0.75])
-                    iqr = float(q3 - q1)
-                    if not np.isfinite(iqr) or iqr == 0:
-                        cap = float(yvals.quantile(clip_q))
-                    else:
-                        cap = float(q3 + clip_k * iqr)
-                else:
-                    cap = float(yvals.quantile(clip_q))
+        cap = self._compute_clip_cap(d[y], clip_method, clip_q, clip_k) if clip_upper else None
 
         # ---------------- Plot each group ----------------
         for g in group_order:
@@ -1059,31 +1010,9 @@ class MEAPlotter:
 
         # ---------------- Upper outliers ----------------
         if show_upper_outliers and cap is not None:
-            upper_out = d[d[y] > cap].copy()
-            if len(upper_out) > 0:
-                ymin_ax, ymax_ax = ax.get_ylim()
-                yr = ymax_ax - ymin_ax
-
-                y_tip = ymax_ax - 0.01 * yr
-                y_stem0 = y_tip - 0.04 * yr
-
-                for _, r in upper_out.iterrows():
-                    div_val = r[div_col]
-                    g = r[group_col]
-                    if div_val not in div_order or g not in group_order:
-                        continue
-
-                    x = float(div_to_x[div_val]) + offsets[g]
-
-                    ax.plot([x, x], [y_stem0, y_tip], color=color_map[g], lw=0.9, zorder=5)
-                    ax.scatter(
-                        [x], [y_tip],
-                        marker="^", s=26,
-                        color=color_map[g],
-                        edgecolor="black",
-                        linewidth=0.25,
-                        zorder=6
-                    )
+            self._draw_upper_outliers(ax, d, y, div_col, group_col,
+                                      div_order, group_order, div_to_x,
+                                      offsets, color_map, cap)
 
         # ---------------- Centralized stats + annotation ----------------
         if annotate:
@@ -1132,8 +1061,8 @@ class MEAPlotter:
         palette=None,
         title=None,
         ylabel=None,
-        figsize=(11.69, 8.27),   # A4 landscape default; use ~(2.24, 3.5) for 1/3-column
-        height_ratios=(3, 2),    # trajectory 60 %, dot plots 40 %
+        figsize=(11.69, 6.5),    # A4 landscape default; use ~(2.24, 3.5) for 1/3-column
+        height_ratios=(2, 1.5),  # trajectory ~57 %, dot plots ~43 %
         clip_upper=True,
         clip_method="quantile",
         clip_q=0.98,
@@ -1141,14 +1070,14 @@ class MEAPlotter:
         scatter_jitter=0.12,
         dot_size=22,
         legend_outside=True,
+        show_legend=False,       # show legend on trajectory panel
         traj_markers=True,       # show mean data-points on trajectory line
-        label_fontsize=9,        # axis label font size
-        tick_fontsize=6,         # tick label font size
-        panel_label_fontsize=10, # A / B / C / D label font size
+        font_sizes=(6, 9),       # (min, max): min→ticks, mid→labels/titles, max→panel letters
         annotate_traj=False,     # show sig brackets on the trajectory line
         show_xtick_labels=False, # show group name labels on dot-plot x-axes
         show_auc=False,          # append an AUC dot-plot panel after the DIV panels
         unit_cols=None,          # col(s) identifying one trajectory, e.g. ['Chip_ID','Well']
+        lmm_results=None,        # dict from test_genotype_lmm(); stamps LRT badge on Panel A
     ):
         """
         A4-landscape two-row publication figure.
@@ -1164,7 +1093,7 @@ class MEAPlotter:
         ----------
         selected_divs : list of int — e.g. [13, 20, 27]
         stats_df      : from calculate_stats_at_timepoints(); computed internally if None
-        figsize       : (w, h) in inches — default A4 landscape (11.69 × 8.27)
+        figsize       : (w, h) in inches — default A4 landscape (11.69 × 6.5)
 
         Returns
         -------
@@ -1178,21 +1107,21 @@ class MEAPlotter:
         selected_divs = [int(v) for v in selected_divs]
         n_sel         = len(selected_divs)
 
-        if isinstance(palette, dict):
-            color_map = {g: palette[g] for g in group_order}
-        else:
-            colors    = sns.color_palette(palette, len(group_order))
-            color_map = {g: colors[i] for i, g in enumerate(group_order)}
+        color_map = self._build_color_map(group_order, palette)
+
+        fs_tick  = font_sizes[0]
+        fs_label = font_sizes[0] + (font_sizes[1] - font_sizes[0]) * 2 // 3  # e.g. 8 for (6,9)
+        fs_panel = font_sizes[1]
 
         rc_overrides = {
             "font.family":      "sans-serif",
-            "font.sans-serif":  ["Liberation Sans", "Arial", "DejaVu Sans", "sans-serif"],
+            "font.sans-serif":  ["Arial", "Liberation Sans", "DejaVu Sans", "sans-serif"],
             "svg.fonttype":     "none",
             "pdf.fonttype":     42,
-            "axes.labelsize":   label_fontsize,
+            "axes.labelsize":   fs_label,
             "axes.labelweight": "bold",
-            "xtick.labelsize":  tick_fontsize,
-            "ytick.labelsize":  tick_fontsize,
+            "xtick.labelsize":  fs_tick,
+            "ytick.labelsize":  fs_tick,
         }
 
         with plt.rc_context(rc_overrides):
@@ -1200,13 +1129,14 @@ class MEAPlotter:
             _has_auc = show_auc and unit_cols is not None
             n_cols   = n_sel + (1 if _has_auc else 0)
             fig = plt.figure(figsize=figsize)
+            _right = 0.87 if (show_legend and legend_outside) else 0.97
             gs  = GridSpec(
                 2, n_cols,
                 figure=fig,
                 height_ratios=list(height_ratios),
-                hspace=0.50,
+                hspace=0.35,
                 wspace=0.05,      # panels share y → nearly zero gap
-                left=0.08, right=0.87,
+                left=0.08, right=_right,
                 top=0.93, bottom=0.10,
             )
             ax_traj  = fig.add_subplot(gs[0, :])
@@ -1237,23 +1167,43 @@ class MEAPlotter:
                 clip_q=clip_q,
                 clip_k=clip_k,
                 legend_outside=legend_outside,
-                show_legend=True,
+                show_legend=show_legend,
             )
 
             # Clear y-axis label — placed via fig.text below to align with dot-plot row
             ax_traj.set_ylabel("")
 
-            # Remove legend border
+            # Legend: remove border; hide entirely if show_legend=False
             leg = ax_traj.get_legend()
             if leg is not None:
-                leg.set_frame_on(False)
+                if show_legend:
+                    leg.set_frame_on(False)
+                else:
+                    leg.remove()
 
             # Panel label A — top-left corner, anchored
             ax_traj.text(
                 0.01, 1.02, "A",
                 transform=ax_traj.transAxes,
-                fontsize=panel_label_fontsize, fontweight="bold", va="bottom", ha="left",
+                fontsize=fs_panel, fontweight="bold", va="bottom", ha="left",
             )
+
+            # LRT badge from test_genotype_lmm() — bottom-right of trajectory panel
+            if lmm_results is not None:
+                def _s(p):
+                    for t, l in [(0.001, "***"), (0.01, "**"), (0.05, "*")]:
+                        if p < t: return l
+                    return "ns"
+                m, i_ = lmm_results["main"], lmm_results["interaction"]
+                _badge = (
+                    f"Genotype main:   χ²({m['df']}) = {m['chi2']:.2f},  p = {m['p']:.3f}  {_s(m['p'])}\n"
+                    f"Genotype × DIV:  χ²({i_['df']}) = {i_['chi2']:.2f},  p = {i_['p']:.3f}  {_s(i_['p'])}"
+                )
+                ax_traj.text(
+                    0.99, 0.03, _badge, transform=ax_traj.transAxes,
+                    fontsize=6, va="bottom", ha="right", family="monospace",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc", alpha=0.9),
+                )
 
             # Narrow grey bands at selected timepoints (0.5 DIV wide)
             div_order_all = self._resolve_div_order(d, div_col, None)
@@ -1269,7 +1219,7 @@ class MEAPlotter:
             sel_vals = d[d[div_col].isin(selected_divs)][y].dropna()
             y_dot_min = float(sel_vals.min()) if len(sel_vals) > 0 else 0.0
             y_dot_cap = float(sel_vals.quantile(clip_q)) if clip_upper and len(sel_vals) > 0 else float(sel_vals.max())
-            y_dot_pad = 0.10 * max(y_dot_cap - y_dot_min, 1e-9)
+            y_dot_pad = 0.05 * max(y_dot_cap - y_dot_min, 1e-9)
             y_dot_max = y_dot_cap + y_dot_pad
 
             # ── Row 1: dot plots (panels B / C / D …) ─────────────────────
@@ -1316,24 +1266,24 @@ class MEAPlotter:
                 ax.text(
                     0.01, 1.02, label,
                     transform=ax.transAxes,
-                    fontsize=panel_label_fontsize, fontweight="bold", va="bottom", ha="left",
+                    fontsize=fs_panel, fontweight="bold", va="bottom", ha="left",
                 )
 
-                # Title: same size as axis labels, not bold
-                ax.set_title(f"DIV {div_val}", fontsize=label_fontsize, fontweight="normal", pad=4)
+                # Title: DIV subtitle, one step below panel letter
+                ax.set_title(f"DIV {div_val}", fontsize=fs_label, fontweight="normal", pad=4)
 
                 # x-axis: horizontal labels, no rotation
                 ax.set_xticks(range(len(group_order)))
                 ax.set_xticklabels(
                     group_order if show_xtick_labels else [""] * len(group_order),
-                    fontsize=tick_fontsize, rotation=0, ha="center",
+                    fontsize=fs_tick, rotation=0, ha="center",
                 )
                 ax.set_xlim(-0.6, len(group_order) - 0.4)
-                ax.tick_params(axis="x", labelsize=tick_fontsize, width=0.8, length=3)
+                ax.tick_params(axis="x", labelsize=fs_tick, width=0.8, length=3)
 
                 # y-axis: ticks and label only on leftmost panel
                 ax.set_ylim(y_dot_min, y_dot_max)
-                ax.tick_params(axis="y", labelsize=tick_fontsize, width=0.8, length=3)
+                ax.tick_params(axis="y", labelsize=fs_tick, width=0.8, length=3)
                 if i > 0:
                     ax.tick_params(axis="y", left=False, labelleft=False)
 
@@ -1358,10 +1308,10 @@ class MEAPlotter:
             _x_lbl = pos_b.x0 - 0.055
             fig.text(_x_lbl, (pos_t.y0 + pos_t.y1) / 2, _ylabel_str,
                      ha="right", va="center", rotation=90,
-                     fontsize=label_fontsize, fontweight="bold")
+                     fontsize=fs_label, fontweight="bold")
             fig.text(_x_lbl, (pos_b.y0 + pos_b.y1) / 2, _ylabel_str,
                      ha="right", va="center", rotation=90,
-                     fontsize=label_fontsize, fontweight="bold")
+                     fontsize=fs_label, fontweight="bold")
 
             # ── AUC panel (optional last panel) ───────────────────────────
             ax_auc = None
@@ -1411,20 +1361,20 @@ class MEAPlotter:
                                     color="black", linewidth=2.0, solid_capstyle="round", zorder=5)
 
                 ax_auc.text(-0.08, 1.08, auc_label, transform=ax_auc.transAxes,
-                            fontsize=panel_label_fontsize, fontweight="bold",
+                            fontsize=fs_panel, fontweight="bold",
                             va="top", ha="right")
-                ax_auc.set_title("AUC", fontsize=label_fontsize,
+                ax_auc.set_title("AUC", fontsize=fs_label,
                                  fontweight="normal", pad=4)
                 ax_auc.set_xticks(range(len(group_order)))
                 ax_auc.set_xticklabels(
                     group_order if show_xtick_labels else [""] * len(group_order),
-                    fontsize=tick_fontsize, rotation=0, ha="center",
+                    fontsize=fs_tick, rotation=0, ha="center",
                 )
                 ax_auc.set_xlim(-0.6, len(group_order) - 0.4)
-                ax_auc.tick_params(axis="x", labelsize=tick_fontsize, width=0.8, length=3)
+                ax_auc.tick_params(axis="x", labelsize=fs_tick, width=0.8, length=3)
                 ax_auc.set_ylim(auc_ymin - auc_pad, auc_cap + auc_pad)
-                ax_auc.tick_params(axis="y", labelsize=tick_fontsize, width=0.8, length=3)
-                ax_auc.set_ylabel("AUC", fontsize=label_fontsize, fontweight="bold")
+                ax_auc.tick_params(axis="y", labelsize=fs_tick, width=0.8, length=3)
+                ax_auc.set_ylabel("AUC", fontsize=fs_label, fontweight="bold")
                 sns.despine(ax=ax_auc)
 
                 if not auc_stats.empty:
@@ -1524,49 +1474,25 @@ class MEAPlotter:
             ax.legend(kept_handles, kept_labels, title=group_col, frameon=False, loc=legend_loc)
 
         # ---- clip cap ----
-        cap = None
-        if clip_upper:
-            yvals = data[y].dropna()
-            if len(yvals) > 0:
-                if clip_method == "iqr":
-                    q1, q3 = yvals.quantile([0.25, 0.75])
-                    iqr = float(q3 - q1)
-                    if not np.isfinite(iqr) or iqr == 0:
-                        cap = float(yvals.quantile(clip_q))
-                    else:
-                        cap = float(q3 + clip_k * iqr)
-                else:
-                    cap = float(yvals.quantile(clip_q))
+        cap = self._compute_clip_cap(data[y], clip_method, clip_q, clip_k) if clip_upper else None
+        if cap is not None:
+            ymin = float(data[y].min())
+            pad  = 0.06 * max(cap - ymin, 1e-9)
+            ax.set_ylim(ymin, cap + pad)
 
-                ymin = float(yvals.min())
-                pad = 0.06 * max(cap - ymin, 1e-9)
-                ax.set_ylim(ymin, cap + pad)
-
-        # ---- upper outliers ----
+        # ---- upper outliers (bar-plot variant: bar-position offsets, larger marker) ----
         if show_upper_outliers and cap is not None:
-            upper_out = data[data[y] > cap]
-            if len(upper_out) > 0:
-                n_groups = len(group_order)
-                bar_width = 0.8 / n_groups
-
-                ymin_ax, ymax_ax = ax.get_ylim()
-                yr = ymax_ax - ymin_ax
-
-                y_tip = ymax_ax - 0.01 * yr
-                y_stem0 = y_tip - 0.06 * yr
-
-                for _, r in upper_out.iterrows():
-                    div_val = r[div_col]
-                    g = r[group_col]
-                    if div_val not in div_order or g not in group_order:
-                        continue
-
-                    div_idx = div_order.index(div_val)
-                    g_idx = group_order.index(g)
-                    x = div_idx + (g_idx - n_groups / 2 + 0.5) * bar_width
-
-                    ax.plot([x, x], [y_stem0, y_tip], color="black", lw=0.9, zorder=10)
-                    ax.scatter([x], [y_tip], marker="^", s=42, color="black", zorder=11)
+            n_groups  = len(group_order)
+            bar_width = 0.8 / n_groups
+            bar_offsets = {g: (i - n_groups / 2 + 0.5) * bar_width
+                           for i, g in enumerate(group_order)}
+            bar_div_to_x = {div: i for i, div in enumerate(div_order)}
+            # use a black color_map for bars (bar outliers use black, not group colour)
+            black_map = {g: "black" for g in group_order}
+            self._draw_upper_outliers(ax, data, y, div_col, group_col,
+                                      div_order, group_order, bar_div_to_x,
+                                      bar_offsets, black_map, cap,
+                                      stem_frac=0.06, marker_size=42)
 
         # ---- centralized stats annotations ----
         if annotate:
