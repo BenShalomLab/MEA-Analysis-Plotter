@@ -165,6 +165,34 @@ def plot_active_area_trajectory(
 
 # ── Genotype-effect test: LMM ────────────────────────────────────────────────
 
+def _fit_lmm_ml(formula, data, unit_col, methods=("powell", "nm", "lbfgs")):
+    """Random-intercept LMM by maximum likelihood (needed for likelihood-ratio tests).
+
+    Tries several optimizers and returns the fit with the highest FINITE log-likelihood among those that converged.
+    Raises RuntimeError if none gives a usable fit. (A fit that returns llf = +/-inf is discarded.)
+    """
+    import warnings
+    import statsmodels.formula.api as smf
+    best, errors = None, []
+    for method in methods:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = smf.mixedlm(formula, data=data, groups=data[unit_col]).fit(reml=False, method=method)
+        except Exception as exc:                      # singular matrix etc.: try the next optimizer
+            errors.append(f"{method}: {type(exc).__name__}")
+            continue
+        llf = float(res.llf)
+        if not np.isfinite(llf) or not bool(getattr(res, "converged", True)):
+            errors.append(f"{method}: llf={llf}, converged={getattr(res, 'converged', None)}")
+            continue
+        if best is None or llf > best.llf:
+            best = res
+    if best is None:
+        raise RuntimeError(f"No usable LMM fit for '{formula}': " + "; ".join(errors))
+    return best
+
+
 def test_genotype_lmm(
     df,
     group_col="NeuronType",
@@ -179,6 +207,8 @@ def test_genotype_lmm(
     show_fit_panel=False,
     plot=True,
     save_path=None,
+    transform=None,
+    center_div=True,
 ):
     """
     Linear mixed model to test whether Active Area differs by genotype.
@@ -191,6 +221,17 @@ def test_genotype_lmm(
 
     Panel A: raw data mean ± SEM + LRT badge.
     Panel B: LMM population-level fitted trajectories (only when show_fit_panel=True).
+
+    Fitting (changed 2026-10-19, see activity_qc_plotter.py.bak_20261019 for the previous version)
+    ---------------------------------------------------------------------------------------------
+    * Each model is fitted with several optimizers and the best FINITE, converged fit is kept. The previous
+      version took the first optimizer that did not raise; for some data L-BFGS returned a log-likelihood of +inf
+      for the null model, giving chi2 = -inf and a spurious p = 1.
+    * If a nested comparison is still not monotone (larger model with lower likelihood) chi2 is set to 0 and a note
+      is added to lrt_results["notes"].
+    * transform : None or "log1p" (or a callable) applied to value_col before fitting, e.g. for counts.
+    * center_div : if True (default) DIV is centred on its mean before fitting, so the genotype coefficients and
+      the pairwise Wald tests are differences at the mean DIV rather than at DIV = 0. LRTs are unaffected.
 
     Returns
     -------
@@ -208,20 +249,27 @@ def test_genotype_lmm(
     df_w = df[[group_col, div_col, value_col, unit_col]].dropna().copy()
     df_w[group_col] = df_w[group_col].astype(str)
 
+    # ── Optional transform and DIV centring (fitting copy only; df_w is kept for plotting) ──────────
+    df_fit = df_w.copy()
+    if transform == "log1p":
+        df_fit[value_col] = np.log1p(df_fit[value_col].astype(float))
+    elif callable(transform):
+        df_fit[value_col] = transform(df_fit[value_col].astype(float))
+    elif transform is not None:
+        raise ValueError("transform must be None, 'log1p' or a callable")
+    if center_div:
+        df_fit[div_col] = df_fit[div_col].astype(float) - df_fit[div_col].astype(float).mean()
+
     # ── Fit three nested models (REML=False required for LRT) ───────────────
     ref_str      = ref.replace("'", "\\'")
     f_null       = f"{value_col} ~ {div_col}"
     f_main       = f"{value_col} ~ C({group_col}, Treatment('{ref_str}')) + {div_col}"
     f_full       = f"{value_col} ~ C({group_col}, Treatment('{ref_str}')) * {div_col}"
 
+    notes = []
+
     def _fit(formula):
-        m = smf.mixedlm(formula, data=df_w, groups=df_w[unit_col])
-        for method in ("lbfgs", "nm", "powell"):
-            try:
-                return m.fit(reml=False, method=method)
-            except Exception:
-                continue
-        return m.fit(reml=False)
+        return _fit_lmm_ml(formula, df_fit, unit_col)
 
     fit_null = _fit(f_null)
     fit_main = _fit(f_main)
@@ -230,8 +278,15 @@ def test_genotype_lmm(
     # ── Likelihood-ratio tests ───────────────────────────────────────────────
     n_extra = len(group_order) - 1   # params added per step (n_groups - 1)
 
-    lrt_main = {"chi2": 2 * (fit_main.llf - fit_null.llf), "df": n_extra}
-    lrt_int  = {"chi2": 2 * (fit_full.llf - fit_main.llf), "df": n_extra}
+    def _chi2(ll_big, ll_small, label):
+        c = 2 * (ll_big - ll_small)
+        if c < 0:                                    # nested ML fits cannot decrease: optimizer failure
+            notes.append(f"{label}: negative chi2 ({c:.3f}) set to 0 (optimizer did not reach the nested optimum)")
+            c = 0.0
+        return c
+
+    lrt_main = {"chi2": _chi2(fit_main.llf, fit_null.llf, "genotype main effect"), "df": n_extra}
+    lrt_int  = {"chi2": _chi2(fit_full.llf, fit_main.llf, "genotype x DIV"), "df": n_extra}
     lrt_main["p"] = chi2_dist.sf(lrt_main["chi2"], df=lrt_main["df"])
     lrt_int["p"]  = chi2_dist.sf(lrt_int["chi2"],  df=lrt_int["df"])
 
@@ -297,8 +352,11 @@ def test_genotype_lmm(
     fe_table = fit_full.summary().tables[1]
     print(fe_table.as_text() if hasattr(fe_table, "as_text") else fe_table.to_string())
 
+    for n_ in notes:
+        print(f"  [note] {n_}")
     lrt_results = {"main": lrt_main, "interaction": lrt_int, "fit_full": fit_full,
-                   "pairwise_wald": pairwise_wald}
+                   "pairwise_wald": pairwise_wald, "notes": notes,
+                   "transform": transform, "center_div": center_div}
 
     if not plot:
         return None, None, None, lrt_results

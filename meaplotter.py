@@ -1078,6 +1078,21 @@ class MEAPlotter:
         show_auc=False,          # append an AUC dot-plot panel after the DIV panels
         unit_cols=None,          # col(s) identifying one trajectory, e.g. ['Chip_ID','Well']
         lmm_results=None,        # dict from test_genotype_lmm(); stamps LRT badge on Panel A
+        fig=None,                # embed in an existing figure: pass fig together with subplot_spec
+        subplot_spec=None,       # SubplotSpec (e.g. one cell of a GridSpec) to draw into instead of creating a new figure
+        traj_label="A",          # panel letter on the trajectory (None = no letter)
+        dot_labels=None,         # None = default B/C/D...; False = no letters; list = custom letters
+        jitter_seed=None,        # seed for the dot jitter (None = unseeded, as before)
+        traj_title=None,         # title above the trajectory (None = keep plot_line_sem_by_div's default)
+        badge_fontsize=6,        # font size of the LRT badge
+        ylabel_dots=True,        # also write the y-label beside the dot-plot row (default True, as before)
+        ylabel_offset=0.055,     # distance of the y-labels left of the dot plots (figure fraction)
+        badge_xy=(0.99, 0.03),   # LRT badge anchor in axes coordinates (x, y)
+        badge_va="bottom",       # LRT badge vertical alignment
+        hspace=0.35,             # vertical gap between the trajectory and the dot plots
+        xlabel_traj=True,        # keep the 'DIV' label under the trajectory
+        badge_style="full",      # "full" = two long lines (default); "compact" = short lines for narrow panels
+        traj_title_pad=3,        # gap between the trajectory title and the axes (raise it to clear a badge above the axes)
     ):
         """
         A4-landscape two-row publication figure.
@@ -1128,17 +1143,23 @@ class MEAPlotter:
             # ── Figure / GridSpec ──────────────────────────────────────────
             _has_auc = show_auc and unit_cols is not None
             n_cols   = n_sel + (1 if _has_auc else 0)
-            fig = plt.figure(figsize=figsize)
-            _right = 0.87 if (show_legend and legend_outside) else 0.97
-            gs  = GridSpec(
-                2, n_cols,
-                figure=fig,
-                height_ratios=list(height_ratios),
-                hspace=0.35,
-                wspace=0.05,      # panels share y → nearly zero gap
-                left=0.08, right=_right,
-                top=0.93, bottom=0.10,
-            )
+            _rng = np.random.default_rng(jitter_seed)
+            if subplot_spec is not None:
+                from matplotlib.gridspec import GridSpecFromSubplotSpec
+                fig = fig if fig is not None else subplot_spec.get_gridspec().figure
+                gs = GridSpecFromSubplotSpec(2, n_cols, subplot_spec=subplot_spec, height_ratios=list(height_ratios), hspace=hspace, wspace=0.05)
+            else:
+                fig = plt.figure(figsize=figsize)
+                _right = 0.87 if (show_legend and legend_outside) else 0.97
+                gs  = GridSpec(
+                    2, n_cols,
+                    figure=fig,
+                    height_ratios=list(height_ratios),
+                    hspace=0.35,
+                    wspace=0.05,      # panels share y → nearly zero gap
+                    left=0.08, right=_right,
+                    top=0.93, bottom=0.10,
+                )
             ax_traj  = fig.add_subplot(gs[0, :])
             dot_axes = [fig.add_subplot(gs[1, i]) for i in range(n_sel)]
 
@@ -1172,6 +1193,10 @@ class MEAPlotter:
 
             # Clear y-axis label — placed via fig.text below to align with dot-plot row
             ax_traj.set_ylabel("")
+            if not xlabel_traj:
+                ax_traj.set_xlabel("")
+            if traj_title is not None:
+                ax_traj.set_title(traj_title, fontsize=fs_label, fontweight="bold", pad=traj_title_pad)
 
             # Legend: remove border; hide entirely if show_legend=False
             leg = ax_traj.get_legend()
@@ -1182,11 +1207,12 @@ class MEAPlotter:
                     leg.remove()
 
             # Panel label A — top-left corner, anchored
-            ax_traj.text(
-                0.01, 1.02, "A",
-                transform=ax_traj.transAxes,
-                fontsize=fs_panel, fontweight="bold", va="bottom", ha="left",
-            )
+            if traj_label:
+                ax_traj.text(
+                    0.01, 1.02, traj_label,
+                    transform=ax_traj.transAxes,
+                    fontsize=fs_panel, fontweight="bold", va="bottom", ha="left",
+                )
 
             # LRT badge from test_genotype_lmm() — bottom-right of trajectory panel
             if lmm_results is not None:
@@ -1199,9 +1225,13 @@ class MEAPlotter:
                     f"Genotype main:   χ²({m['df']}) = {m['chi2']:.2f},  p = {m['p']:.3f}  {_s(m['p'])}\n"
                     f"Genotype × DIV:  χ²({i_['df']}) = {i_['chi2']:.2f},  p = {i_['p']:.3f}  {_s(i_['p'])}"
                 )
+                if badge_style == "compact":
+                    _pf = lambda p_: "p<0.001" if p_ < 0.001 else f"p={p_:.3f}"
+                    _badge = (f"Geno. χ²={m['chi2']:.1f} {_pf(m['p'])} {_s(m['p'])}\n"
+                              f"×DIV  χ²={i_['chi2']:.1f} {_pf(i_['p'])} {_s(i_['p'])}")
                 ax_traj.text(
-                    0.99, 0.03, _badge, transform=ax_traj.transAxes,
-                    fontsize=6, va="bottom", ha="right", family="monospace",
+                    badge_xy[0], badge_xy[1], _badge, transform=ax_traj.transAxes,
+                    fontsize=badge_fontsize, va=badge_va, ha="right", family="monospace",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#cccccc", alpha=0.9),
                 )
 
@@ -1228,7 +1258,7 @@ class MEAPlotter:
             for i, div_val in enumerate(selected_divs):
                 ax       = dot_axes[i]
                 div_data = d[d[div_col] == div_val]
-                label    = panel_labels[i]
+                label    = (dot_labels[i] if isinstance(dot_labels, (list, tuple)) else panel_labels[i])
 
                 for j, g in enumerate(group_order):
                     vals  = div_data.loc[div_data[group_col] == g, y].dropna()
@@ -1237,7 +1267,7 @@ class MEAPlotter:
 
                     # Jittered scatter
                     if len(plot_vals) > 0:
-                        xs = np.full(len(plot_vals), j) + np.random.uniform(
+                        xs = np.full(len(plot_vals), j) + _rng.uniform(
                             -scatter_jitter, scatter_jitter, size=len(plot_vals),
                         )
                         ax.scatter(
@@ -1263,11 +1293,12 @@ class MEAPlotter:
                                 solid_capstyle="round", zorder=5)
 
                 # Panel label B/C/D — top-left corner, anchored
-                ax.text(
-                    0.01, 1.02, label,
-                    transform=ax.transAxes,
-                    fontsize=fs_panel, fontweight="bold", va="bottom", ha="left",
-                )
+                if dot_labels is not False:
+                    ax.text(
+                        0.01, 1.02, label,
+                        transform=ax.transAxes,
+                        fontsize=fs_panel, fontweight="bold", va="bottom", ha="left",
+                    )
 
                 # Title: DIV subtitle, one step below panel letter
                 ax.set_title(f"DIV {div_val}", fontsize=fs_label, fontweight="normal", pad=4)
@@ -1305,13 +1336,14 @@ class MEAPlotter:
             _ylabel_str = ylabel or y.replace("_", " ")
             pos_t  = ax_traj.get_position()
             pos_b  = dot_axes[0].get_position()
-            _x_lbl = pos_b.x0 - 0.055
+            _x_lbl = pos_b.x0 - ylabel_offset
             fig.text(_x_lbl, (pos_t.y0 + pos_t.y1) / 2, _ylabel_str,
                      ha="right", va="center", rotation=90,
                      fontsize=fs_label, fontweight="bold")
-            fig.text(_x_lbl, (pos_b.y0 + pos_b.y1) / 2, _ylabel_str,
-                     ha="right", va="center", rotation=90,
-                     fontsize=fs_label, fontweight="bold")
+            if ylabel_dots:
+                fig.text(_x_lbl, (pos_b.y0 + pos_b.y1) / 2, _ylabel_str,
+                         ha="right", va="center", rotation=90,
+                         fontsize=fs_label, fontweight="bold")
 
             # ── AUC panel (optional last panel) ───────────────────────────
             ax_auc = None
@@ -1345,7 +1377,7 @@ class MEAPlotter:
                     color = color_map[g]
                     pvals = vals[vals <= auc_cap] if clip_upper else vals
                     if len(pvals) > 0:
-                        xs = np.full(len(pvals), j) + np.random.uniform(
+                        xs = np.full(len(pvals), j) + _rng.uniform(
                             -scatter_jitter, scatter_jitter, size=len(pvals),
                         )
                         ax_auc.scatter(xs, pvals, color=color, alpha=0.70, s=dot_size,
