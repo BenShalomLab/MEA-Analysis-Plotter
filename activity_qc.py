@@ -48,8 +48,9 @@ def detect_outliers_within_groups(
         if mad <= 0:
             continue
         modz = 0.6745 * (vals - med) / mad
-        df.loc[group.index[np.abs(modz) > z_thresh], 'is_outlier'] = True
-    print(f'Marked {int(df["is_outlier"].sum())} MAD-based outliers (|modZ| > {z_thresh})')
+        # one-sided: only points BELOW the median are outliers (high activity is not a QC failure)
+        df.loc[group.index[modz < -z_thresh], 'is_outlier'] = True
+    print(f'Marked {int(df["is_outlier"].sum())} lower-side MAD outliers (modZ < -{z_thresh})')
     return df
 
 

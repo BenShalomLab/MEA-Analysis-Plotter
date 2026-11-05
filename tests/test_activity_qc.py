@@ -55,4 +55,8 @@ class Parity(unittest.TestCase):
         self.assertFalse(out['is_outlier'].any())
         with contextlib.redirect_stdout(io.StringIO()):out=module.detect_outliers_within_groups(df.iloc[:4])
         self.assertFalse(out['is_outlier'].any())
+    def test_only_low_outliers_are_flagged(self):
+        df=pd.DataFrame({'NeuronType':['A']*8,'CHIP_WELL':list('abcdefgh'),'DIV':[21]*8,'Active_area':[50,52,48,51,49,50,5,100]})
+        with contextlib.redirect_stdout(io.StringIO()):out=module.detect_outliers_within_groups(df)
+        self.assertEqual(out.loc[out['is_outlier'],'CHIP_WELL'].tolist(),['g'])
 if __name__=='__main__':unittest.main()
